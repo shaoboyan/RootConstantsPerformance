@@ -41,6 +41,10 @@ inline void ThrowIfFailed(HRESULT hr) {
   }
 }
 
+// Helper function to download results from buffers.
+// It download the content based on the dispatch_thread_num.
+// It tries to download content from the head, middle and tail
+// part of the buffer if thread number is large enough.
 void DownloadResultBufferContents(ComPtr<ID3D12Device> device,
   ComPtr<ID3D12CommandQueue> command_queue,
   ComPtr<ID3D12Resource> result_buffer,
@@ -150,8 +154,12 @@ int main(int argc, char* argv[]) {
   uint32_t dispatch_times_per_frame = 256;
   uint32_t frame_num = 1;
   uint32_t thread_block_size = 32;
+
+  // The content size that use root constants or uniform buffer to upload.
   size_t constant_upload_bytes = 64;
   const size_t bytes_per_element = 4;
+  
+  // The number of float each thread load and out to result buffer.
   const size_t element_per_thread = 4;
   const size_t buffer_alignment_bytes = 256;
   const uint32_t dispatch_thread_num = thread_block_size * dispatch_block_num;
@@ -266,6 +274,7 @@ int main(int argc, char* argv[]) {
     debug_controller->EnableDebugLayer();
   }
 
+  // Acquire adapter and create device
   ComPtr<IDXGIFactory4> factory;
   if (debug_mode) {
     ThrowIfFailed(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)));
@@ -292,6 +301,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Create compute root signature.
   D3D12_FEATURE_DATA_ROOT_SIGNATURE feature_data = {};
 
   // This is the highest version the sample supports. If CheckFeatureSupport succeeds, the
@@ -419,7 +429,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       device->CreateComputePipelineState(&compute_pso_desc, IID_PPV_ARGS(&compute_state[i])));
   }
 
-  // The input constant buffer
+  // Create upload buffer and input buffers. Upload contents to the input buffer.
   size_t content_size = bytes_per_element * element_per_thread * dispatch_thread_num;
   size_t align = content_size / buffer_alignment_bytes;
   if (content_size % buffer_alignment_bytes > 0) {
@@ -504,6 +514,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     WaitForSingleObject(fence_event, INFINITE);
   }
 
+  // Create srv on the input buffer
   ComPtr<ID3D12DescriptorHeap> srv_uav_heap;
   uint32_t num_descriptors = dispatch_times_per_frame + 1;
 
@@ -532,7 +543,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
   CD3DX12_CPU_DESCRIPTOR_HANDLE uav_handle(srv_uav_heap->GetCPUDescriptorHandleForHeapStart(), 1,
     srv_uav_descriptor_size);
 
-  // Output buffers.
+  // Create output buffers and uavs.
   const D3D12_HEAP_PROPERTIES uav_resource_heap =
     CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
   const D3D12_RESOURCE_DESC uav_buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(
@@ -558,6 +569,8 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     uav_handle.Offset(1, srv_uav_descriptor_size);
   }
 
+  // Prepare constant buffer and upload buffers. To support using uniform buffer to upload
+  // constants.
   align = constant_upload_bytes / buffer_alignment_bytes;
   if (constant_upload_bytes % buffer_alignment_bytes > 0) {
     align += 1;
@@ -589,23 +602,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&constant_buffer[i])));
   }
 
-  uint32_t compute_allocator_num = use_batch_mode ? 1 : dispatch_times_per_frame;
-  std::vector<ComPtr<ID3D12CommandAllocator>> compute_command_allocators(compute_allocator_num);
 
-  for (uint32_t i = 0; i < compute_allocator_num; ++i) {
-    ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-      IID_PPV_ARGS(&compute_command_allocators[i])));
-  }
-
-  uint32_t compute_command_list_num = use_batch_mode ? 1 : dispatch_times_per_frame;
-  std::vector<ComPtr<ID3D12GraphicsCommandList>> compute_command_lists(compute_command_list_num);
-
-  for (uint32_t i = 0; i < compute_command_list_num; ++i) {
-    ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-      compute_command_allocators[i].Get(), nullptr,
-      IID_PPV_ARGS(&compute_command_lists[i])));
-    ThrowIfFailed(compute_command_lists[i]->Close());
-  }
 
   uint32_t constant_element_num =
     static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
@@ -621,6 +618,28 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
   uint32_t submit_num = use_batch_mode ? 1 : dispatch_times_per_frame;
   uint32_t dispatch_num_per_submit = use_batch_mode ? dispatch_times_per_frame : 1;
+
+  // Create compute command allocator and compute command lists. For no batching mode,
+  // we record single dispatch in one command list and submit it immediately. Reuse the
+  // command list for each submit introduce fence waiting, which impact the peformance
+  // measurement. So creating allocator and command lists based on counts of submit. In
+  // this way, we avoid reusing the command list and no need to wait for fence before next
+  // submission.
+  std::vector<ComPtr<ID3D12CommandAllocator>> compute_command_allocators(submit_num);
+
+  for (uint32_t i = 0; i < submit_num; ++i) {
+    ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+      IID_PPV_ARGS(&compute_command_allocators[i])));
+  }
+
+  std::vector<ComPtr<ID3D12GraphicsCommandList>> compute_command_lists(submit_num);
+
+  for (uint32_t i = 0; i < submit_num; ++i) {
+    ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+      compute_command_allocators[i].Get(), nullptr,
+      IID_PPV_ARGS(&compute_command_lists[i])));
+    ThrowIfFailed(compute_command_lists[i]->Close());
+  }
 
   D3D12_RESOURCE_BARRIER copy_dest_to_constant_barrier;
   copy_dest_to_constant_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -708,8 +727,6 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       WaitForSingleObject(fence_event, INFINITE);
     }
   }
-
-  // Get end time
 
   if (debug_mode) {
     uint32_t download_uav_buffer_index = 0;
