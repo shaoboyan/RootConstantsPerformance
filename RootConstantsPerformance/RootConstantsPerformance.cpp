@@ -374,6 +374,8 @@ int main(int argc, char* argv[]) {
   std::string compute_shader_source_code =
     "#define threadBlockSize " + std::to_string(thread_block_size) + std::string("\n");
   compute_shader_source_code += std::string("cbuffer ConstantMasks : register(b0) {\n");
+
+  // The mask is float4 vector type in shader.
   uint32_t mask_num = constant_upload_elements_num / 4;
 
   for (uint32_t i = 0; i < mask_num; ++i) {
@@ -602,16 +604,11 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&constant_buffer[i])));
   }
 
-
-
-  uint32_t constant_element_num =
-    static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
-
   std::vector<std::vector<float>> upload_constants(dispatch_times_per_frame);
 
   for (uint32_t i = 0; i < dispatch_times_per_frame; ++i) {
-    upload_constants[i].resize(constant_element_num);
-    for (uint32_t j = 0; j < constant_element_num; ++j) {
+    upload_constants[i].resize(constant_upload_elements_num);
+    for (uint32_t j = 0; j < constant_upload_elements_num; ++j) {
       upload_constants[i][j] = distribution(engine);
     }
   }
@@ -649,6 +646,10 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
   copy_dest_to_constant_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
+  // Record start time
+  std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
+  start = std::chrono::high_resolution_clock::now();
+
   for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
     uint32_t submit_dispatch_num = 0;
     for (uint32_t submit_count = 0; submit_count < submit_num;
@@ -679,7 +680,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
         if (use_root_constants) {
           compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
-            0, constant_element_num,
+            0, constant_upload_elements_num,
             reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
         }
         else {
@@ -689,7 +690,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
           ThrowIfFailed(cbv_upload_buffer[dispatch_count_in_submit]->Map(
             0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
           memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
-            sizeof(float) * constant_element_num);
+            sizeof(float) * constant_upload_elements_num);
           cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
 
           compute_command_lists[submit_count]->CopyBufferRegion(
@@ -727,6 +728,20 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       WaitForSingleObject(fence_event, INFINITE);
     }
   }
+
+  // record end time
+  end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::nano> elapsed_nanoseconds = end - start;
+  double average_nanoseconds_per_frame = elapsed_nanoseconds.count() / frame_num;
+
+  if (debug_mode) {
+    std::cout << std::endl;
+    std::cout << "NOTE:Debug mode on, time is not accurate." << std::endl;
+  }
+
+  std::cout << "Average frame time (ns): " << average_nanoseconds_per_frame << " ns;" << std::endl;
+  std::cout << std::endl;
+
 
   if (debug_mode) {
     uint32_t download_uav_buffer_index = 0;
