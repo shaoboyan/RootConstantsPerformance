@@ -1,0 +1,8 @@
+RootConstantsPerformance/.vs/
+RootConstantsPerformance/x64/
+RootConstantsPerformance/Debug/
+RootConstantsPerformance/Release/
+RootConstantsPerformance/*.sln
+RootConstantsPerformance/*.vcxproj
+RootConstantsPerformance/*.filters
+RootConstantsPerformance/*.user
