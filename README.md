@@ -23,9 +23,9 @@ Command Lines Options :
 This mode tries to simulate a case we observed in TFJS webgpu backend. In TFJS, webgpu backend batch all dispatches in a single submit to achieve a
 better performance than dispatch and submit immediately.
 
-## Use uniform buffer
+## Use Uniform Buffer
 In TFJS, Op knows the uniform data (e.g. shape) when it is executing. So TFJS WebGPU backend employees `WriteBuffer` to update such uniforms. The
 "use uniform buffer" uploading mode tries to simulate this behaviour by uploading cpu data to upload buffer first and then copy to default buffer.
 
-## use dbo
+## Use DBO
 DBO is another common use case that developer knows all uniforms and choose which one to use in runtime.
