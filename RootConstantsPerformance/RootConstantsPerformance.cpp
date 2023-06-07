@@ -201,29 +201,29 @@ int main(int argc, char* argv[]) {
                          "dispatch in different command lists and submit them every time."
                       << std::endl;
             std::cout << "--dispatch_block_num NUM:                setting numbers of dispatched "
-                         "blocks, default value is 128."
+                         "blocks, default value is 512."
                       << std::endl;
             std::cout << "--thread_block_size NUM:                 setting 1-dimension block size, "
-                         "default value is 32."
+                         "default value is 512."
                       << std::endl;
             std::cout << "--dispatch_times_per_frame NUM:          setting dispatch numbers per "
-                         "frame, default value is 256."
+                         "frame, default value is 512."
                       << std::endl;
             std::cout << "--frame_num NUM:                         setting running frame numbers, "
-                         "default value is 3."
+                         "default value is 10."
                       << std::endl;
             std::cout << "--constant_upload_bytes NUM:             setting upload constant bytes, "
                          "default value is 64, min: 16, max: 512, must divide by 16."
                       << std::endl;
             std::cout
-                << "--cbuffer_use_scalars:                    compute shader cbuffer uses float4 "
+                << "--cbuffer_use_scalars:                   compute shader cbuffer uses float4 "
                    "scalars. This is the default behaviour"
                 << std::endl;
             std::cout
-                << "--cbuffer_use_array:                      compute shader cbuffer uses float4 "
+                << "--cbuffer_use_array:                     compute shader cbuffer uses float4 "
                    "array. Only for not root constants uploading mode."
                 << std::endl;
-            std::cout << "--handle_oob_with_clamp                   using clamp when access "
+            std::cout << "--handle_oob_with_clamp                  using clamp when access "
                          "cbuffer constants. "
                          "This affects performance when cbuffer constants is array type. "
                       << std::endl;
