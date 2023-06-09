@@ -165,6 +165,7 @@ int main(int argc, char* argv[]) {
     bool handle_oob_with_clamp = false;
     uint32_t dispatch_block_num = 512;
     uint32_t dispatch_times_per_frame = 512;
+    uint32_t warm_run_num = 20;
     uint32_t frame_num = 10;
     uint32_t thread_block_size = 512;
 
@@ -211,6 +212,9 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             std::cout << "--frame_num NUM:                         setting running frame numbers, "
                          "default value is 10."
+                      << std::endl;
+            std::cout << "--warm_run_num NUM:                      setting warm run frame numbers, "
+                         "default value is 20."
                       << std::endl;
             std::cout << "--constant_upload_bytes NUM:             setting upload constant bytes, "
                          "default value is 64, min: 16, max: 512, must divide by 16."
@@ -279,6 +283,12 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (std::string(argv[i]) == "--warm_run_num") {
+            ++i;
+            warm_run_num = atoi(argv[i]);
+            continue;
+        }
+
         if (std::string(argv[i]) == "--constant_upload_bytes") {
             ++i;
             constant_upload_bytes = atoi(argv[i]);
@@ -312,6 +322,7 @@ int main(int argc, char* argv[]) {
     std::cout << "thread_block_size: " << thread_block_size << std::endl;
     std::cout << "dispatch_times_per_frame: " << dispatch_times_per_frame << std::endl;
     std::cout << "frame_num: " << frame_num << std::endl;
+    std::cout << "warm_run_num: " << warm_run_num << std::endl;
     std::cout << "constant_upload_bytes: " << constant_upload_bytes << std::endl;
     std::cout << "cbuffer_use_scalars: " << (cbuffer_content_type == scalar) << std::endl;
     std::cout << "cbuffer_use_array: " << (cbuffer_content_type == array) << std::endl;
@@ -346,10 +357,19 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (desc.VendorId == 0x1414) {
+            continue;
+        }
+
         if (D3D12CreateDevice(hardware_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
                               IID_PPV_ARGS(&device)) > 0) {
             break;
         }
+
+        std::cout << "Query Adapters and creating device...." << std::endl;
+        std::cout << "Adapter Info: " << std::endl;
+        printf("Vendor ID : %#06x \n", desc.VendorId);
+        printf("Device ID : %#06x \n", desc.DeviceId);
     }
 
     // Create compute root signature.
@@ -807,7 +827,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
     double total_time_nanoseconds = 0.0;
 
-    for (uint32_t frame_count = 0; frame_count < frame_num + 1; ++frame_count) {
+    for (uint32_t frame_count = 0; frame_count < frame_num + warm_run_num; ++frame_count) {
         start = std::chrono::high_resolution_clock::now();
         uint32_t submit_dispatch_num = 0;
         for (uint32_t submit_count = 0; submit_count < submit_num;
@@ -896,15 +916,11 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
         }
         end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::nano> elapsed_nanoseconds = end - start;
-        if (frame_count > 0) {
+        if (frame_count >= warm_run_num) {
             total_time_nanoseconds += elapsed_nanoseconds.count();
+            std::cout << "Frame " << std::to_string(frame_count - warm_run_num)
+                      << " time (ns) : " << elapsed_nanoseconds.count() << " ns;" << std::endl;
         }
-        if (frame_count == 0) {
-            std::cout << "(Frame 0 is not take into average time calculation) ";
-        }
-
-        std::cout << "Frame " << std::to_string(frame_count)
-                  << " time (ns) : " << elapsed_nanoseconds.count() << " ns;" << std::endl;
     }
 
     double average_nanoseconds_per_frame = total_time_nanoseconds / frame_num;
