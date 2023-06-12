@@ -163,6 +163,7 @@ int main(int argc, char* argv[]) {
     CbufferContentType cbuffer_content_type = scalar;
     bool debug_mode = false;
     bool handle_oob_with_clamp = false;
+    bool use_timestamp_query = false;
     uint32_t dispatch_block_num = 512;
     uint32_t dispatch_times_per_frame = 512;
     uint32_t warm_run_num = 20;
@@ -230,6 +231,8 @@ int main(int argc, char* argv[]) {
             std::cout << "--handle_oob_with_clamp                  using clamp when access "
                          "cbuffer constants. "
                          "This affects performance when cbuffer constants is array type. "
+                      << std::endl;
+            std::cout << "--use_timestamp_query                    enable timestamp query."
                       << std::endl;
             return 1;
         }
@@ -309,6 +312,11 @@ int main(int argc, char* argv[]) {
             handle_oob_with_clamp = true;
             continue;
         }
+
+        if (std::string(argv[i]) == "--use_timestamp_query") {
+            use_timestamp_query = true;
+            continue;
+        }
     }
 
     std::cout << "Start running .... " << std::endl;
@@ -327,6 +335,7 @@ int main(int argc, char* argv[]) {
     std::cout << "cbuffer_use_scalars: " << (cbuffer_content_type == scalar) << std::endl;
     std::cout << "cbuffer_use_array: " << (cbuffer_content_type == array) << std::endl;
     std::cout << "handle_oob_with_clamp: " << handle_oob_with_clamp << std::endl;
+    std::cout << "use_timestamp_query: " << use_timestamp_query << std::endl;
 
     const uint32_t constant_upload_elements_num =
         static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
@@ -801,6 +810,38 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     uint32_t submit_num = use_batch_mode ? 1 : dispatch_times_per_frame;
     uint32_t dispatch_num_per_submit = use_batch_mode ? dispatch_times_per_frame : 1;
 
+    ComPtr<ID3D12QueryHeap> query_heap;
+    D3D12_HEAP_PROPERTIES query_read_back_buffer_heap;
+    D3D12_RESOURCE_DESC query_read_back_buffer_desc;
+    size_t query_read_back_buffer_size = 0;
+    std::vector<ComPtr<ID3D12Resource>> query_read_back_buffers;
+    const uint32_t query_time_per_dispatch = 2;
+
+    if (use_timestamp_query) {
+        D3D12_QUERY_HEAP_DESC desc = {};
+        desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        desc.Count = dispatch_num_per_submit * submit_num * query_time_per_dispatch;
+        ThrowIfFailed(device->CreateQueryHeap(&desc, IID_PPV_ARGS(&query_heap)));
+
+        query_read_back_buffer_heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+
+        size_t timestamp_query_size = sizeof(UINT64) * desc.Count;
+        align = timestamp_query_size / buffer_alignment_bytes;
+        if (timestamp_query_size % buffer_alignment_bytes > 0) {
+            align += 1;
+        }
+        query_read_back_buffer_size = align * buffer_alignment_bytes;
+        query_read_back_buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(query_read_back_buffer_size);
+
+        query_read_back_buffers.resize(frame_num);
+        for (uint32_t i = 0; i < frame_num; ++i) {
+            ThrowIfFailed(device->CreateCommittedResource(
+                &query_read_back_buffer_heap, D3D12_HEAP_FLAG_NONE, &query_read_back_buffer_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&query_read_back_buffers[i])));
+        }
+    }
+
     // Create compute command allocator and compute command lists. For no batching mode,
     // we record single dispatch in one command list and submit it immediately. Reuse the
     // command list for each submit introduce fence waiting, which impact the peformance
@@ -914,97 +955,214 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
     // Real run rounds, recording start time
     std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
-    std::vector<std::chrono::duration<double, std::nano>> elapsed_nanoseconds[frame_num];
+    std::vector<std::chrono::duration<double, std::nano>> elapsed_nanoseconds;
 
-    for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
-        start = std::chrono::high_resolution_clock::now();
-        uint32_t submit_dispatch_num = 0;
-        for (uint32_t submit_count = 0; submit_count < submit_num;
-             ++submit_count, submit_dispatch_num += dispatch_num_per_submit) {
-            // Command list allocators can only be reset when the associated
-            // command lists have finished execution on the GPU; apps should use
-            // fences to determine GPU execution progress.
-            ThrowIfFailed(compute_command_allocators[submit_count]->Reset());
+    if (use_timestamp_query) {
+        for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
+            elapsed_nanoseconds.resize(frame_num);
+            start = std::chrono::high_resolution_clock::now();
+            uint32_t submit_dispatch_num = 0;
+            for (uint32_t submit_count = 0; submit_count < submit_num;
+                 ++submit_count, submit_dispatch_num += dispatch_num_per_submit) {
+                // Command list allocators can only be reset when the associated
+                // command lists have finished execution on the GPU; apps should use
+                // fences to determine GPU execution progress.
+                ThrowIfFailed(compute_command_allocators[submit_count]->Reset());
 
-            // However, when ExecuteCommandList() is called on a particular command
-            // list, that command list can then be reset at any time and must be before
-            // re-recording.
-            ThrowIfFailed(compute_command_lists[submit_count]->Reset(
-                compute_command_allocators[submit_count].Get(), nullptr));
+                // However, when ExecuteCommandList() is called on a particular command
+                // list, that command list can then be reset at any time and must be before
+                // re-recording.
+                ThrowIfFailed(compute_command_lists[submit_count]->Reset(
+                    compute_command_allocators[submit_count].Get(), nullptr));
 
-            ID3D12DescriptorHeap* pp_heaps[] = {srv_uav_heap.Get()};
-            compute_command_lists[submit_count]->SetDescriptorHeaps(_countof(pp_heaps), pp_heaps);
-            compute_command_lists[submit_count]->SetComputeRootSignature(
-                compute_root_signature.Get());
+                ID3D12DescriptorHeap* pp_heaps[] = {srv_uav_heap.Get()};
+                compute_command_lists[submit_count]->SetDescriptorHeaps(_countof(pp_heaps),
+                                                                        pp_heaps);
+                compute_command_lists[submit_count]->SetComputeRootSignature(
+                    compute_root_signature.Get());
 
-            ++signal_fence_value;
+                ++signal_fence_value;
 
-            for (uint32_t dispatch_count_in_submit = 0;
-                 dispatch_count_in_submit < dispatch_num_per_submit; ++dispatch_count_in_submit) {
-                uint32_t dispatch_count = submit_dispatch_num + dispatch_count_in_submit;
-                compute_command_lists[submit_count]->SetPipelineState(
-                    compute_state[dispatch_count_in_submit].Get());
+                for (uint32_t dispatch_count_in_submit = 0;
+                     dispatch_count_in_submit < dispatch_num_per_submit;
+                     ++dispatch_count_in_submit) {
+                    uint32_t dispatch_count = submit_dispatch_num + dispatch_count_in_submit;
+                    compute_command_lists[submit_count]->SetPipelineState(
+                        compute_state[dispatch_count_in_submit].Get());
 
-                if (upload_mode == use_root_constants) {
-                    compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
-                        0, constant_upload_elements_num,
-                        reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
+                    compute_command_lists[submit_count]->EndQuery(
+                        query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, dispatch_count * 2);
+
+                    if (upload_mode == use_root_constants) {
+                        compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
+                            0, constant_upload_elements_num,
+                            reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
+                    }
+
+                    if (upload_mode == use_uniform_buffer) {
+                        float* p_upload_data_begin;
+                        CD3DX12_RANGE read_range(
+                            0, 0);  // We do not intend to read from this resource on the CPU.
+                        ThrowIfFailed(cbv_upload_buffer[dispatch_count_in_submit]->Map(
+                            0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
+                        memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
+                               sizeof(float) * constant_upload_elements_num);
+                        cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
+
+                        compute_command_lists[submit_count]->CopyBufferRegion(
+                            constant_buffer[dispatch_count_in_submit].Get(), 0,
+                            cbv_upload_buffer[dispatch_count_in_submit].Get(), 0,
+                            constant_buffer_size);
+                        copy_dest_to_constant_barrier.Transition.pResource =
+                            constant_buffer[dispatch_count_in_submit].Get();
+                        compute_command_lists[submit_count]->ResourceBarrier(
+                            1, &copy_dest_to_constant_barrier);
+
+                        compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
+                            0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
+                    }
+
+                    if (upload_mode == use_dbo) {
+                        D3D12_GPU_VIRTUAL_ADDRESS buffer_location =
+                            constant_buffer[0]->GetGPUVirtualAddress() +
+                            dispatch_count * constant_buffer_size;
+                        compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
+                            0, buffer_location);
+                    }
+
+                    compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
+                        1, srv_uav_heap->GetGPUDescriptorHandleForHeapStart());
+                    compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
+                        2, CD3DX12_GPU_DESCRIPTOR_HANDLE(
+                               srv_uav_heap->GetGPUDescriptorHandleForHeapStart(),
+                               dispatch_count + 1, srv_uav_descriptor_size));
+
+                    compute_command_lists[submit_count]->Dispatch(dispatch_block_num, 1, 1);
+
+                    compute_command_lists[submit_count]->EndQuery(
+                        query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, dispatch_count * 2 + 1);
                 }
 
-                if (upload_mode == use_uniform_buffer) {
-                    float* p_upload_data_begin;
-                    CD3DX12_RANGE read_range(
-                        0, 0);  // We do not intend to read from this resource on the CPU.
-                    ThrowIfFailed(cbv_upload_buffer[dispatch_count_in_submit]->Map(
-                        0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
-                    memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
-                           sizeof(float) * constant_upload_elements_num);
-                    cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
+                compute_command_lists[submit_count]->ResolveQueryData(
+                    query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                    submit_count * dispatch_num_per_submit,
+                    dispatch_num_per_submit * query_time_per_dispatch,
+                    query_read_back_buffers[frame_count].Get(),
+                    submit_count * dispatch_num_per_submit * query_time_per_dispatch *
+                        sizeof(UINT64));
 
-                    compute_command_lists[submit_count]->CopyBufferRegion(
-                        constant_buffer[dispatch_count_in_submit].Get(), 0,
-                        cbv_upload_buffer[dispatch_count_in_submit].Get(), 0, constant_buffer_size);
-                    copy_dest_to_constant_barrier.Transition.pResource =
-                        constant_buffer[dispatch_count_in_submit].Get();
-                    compute_command_lists[submit_count]->ResourceBarrier(
-                        1, &copy_dest_to_constant_barrier);
+                ThrowIfFailed(compute_command_lists[submit_count]->Close());
 
-                    compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
-                        0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
-                }
+                ID3D12CommandList* submit_command_lists[] = {
+                    compute_command_lists[submit_count].Get()};
+                command_queue->ExecuteCommandLists(1, submit_command_lists);
 
-                if (upload_mode == use_dbo) {
-                    D3D12_GPU_VIRTUAL_ADDRESS buffer_location =
-                        constant_buffer[0]->GetGPUVirtualAddress() +
-                        dispatch_count * constant_buffer_size;
-                    compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
-                        0, buffer_location);
-                }
-
-                compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
-                    1, srv_uav_heap->GetGPUDescriptorHandleForHeapStart());
-                compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
-                    2, CD3DX12_GPU_DESCRIPTOR_HANDLE(
-                           srv_uav_heap->GetGPUDescriptorHandleForHeapStart(), dispatch_count + 1,
-                           srv_uav_descriptor_size));
-
-                compute_command_lists[submit_count]->Dispatch(dispatch_block_num, 1, 1);
+                ThrowIfFailed(command_queue->Signal(fence.Get(), signal_fence_value));
             }
 
-            ThrowIfFailed(compute_command_lists[submit_count]->Close());
-
-            ID3D12CommandList* submit_command_lists[] = {compute_command_lists[submit_count].Get()};
-            command_queue->ExecuteCommandLists(1, submit_command_lists);
-
-            ThrowIfFailed(command_queue->Signal(fence.Get(), signal_fence_value));
+            if (fence->GetCompletedValue() < signal_fence_value) {
+                ThrowIfFailed(fence->SetEventOnCompletion(signal_fence_value, fence_event));
+                WaitForSingleObject(fence_event, INFINITE);
+            }
+            end = std::chrono::high_resolution_clock::now();
+            elapsed_nanoseconds[frame_count] = end - start;
         }
+    } else {
+        for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
+            elapsed_nanoseconds.resize(frame_num);
+            start = std::chrono::high_resolution_clock::now();
+            uint32_t submit_dispatch_num = 0;
+            for (uint32_t submit_count = 0; submit_count < submit_num;
+                 ++submit_count, submit_dispatch_num += dispatch_num_per_submit) {
+                // Command list allocators can only be reset when the associated
+                // command lists have finished execution on the GPU; apps should use
+                // fences to determine GPU execution progress.
+                ThrowIfFailed(compute_command_allocators[submit_count]->Reset());
 
-        if (fence->GetCompletedValue() < signal_fence_value) {
-            ThrowIfFailed(fence->SetEventOnCompletion(signal_fence_value, fence_event));
-            WaitForSingleObject(fence_event, INFINITE);
+                // However, when ExecuteCommandList() is called on a particular command
+                // list, that command list can then be reset at any time and must be before
+                // re-recording.
+                ThrowIfFailed(compute_command_lists[submit_count]->Reset(
+                    compute_command_allocators[submit_count].Get(), nullptr));
+
+                ID3D12DescriptorHeap* pp_heaps[] = {srv_uav_heap.Get()};
+                compute_command_lists[submit_count]->SetDescriptorHeaps(_countof(pp_heaps),
+                                                                        pp_heaps);
+                compute_command_lists[submit_count]->SetComputeRootSignature(
+                    compute_root_signature.Get());
+
+                ++signal_fence_value;
+
+                for (uint32_t dispatch_count_in_submit = 0;
+                     dispatch_count_in_submit < dispatch_num_per_submit;
+                     ++dispatch_count_in_submit) {
+                    uint32_t dispatch_count = submit_dispatch_num + dispatch_count_in_submit;
+                    compute_command_lists[submit_count]->SetPipelineState(
+                        compute_state[dispatch_count_in_submit].Get());
+
+                    if (upload_mode == use_root_constants) {
+                        compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
+                            0, constant_upload_elements_num,
+                            reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
+                    }
+
+                    if (upload_mode == use_uniform_buffer) {
+                        float* p_upload_data_begin;
+                        CD3DX12_RANGE read_range(
+                            0, 0);  // We do not intend to read from this resource on the CPU.
+                        ThrowIfFailed(cbv_upload_buffer[dispatch_count_in_submit]->Map(
+                            0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
+                        memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
+                               sizeof(float) * constant_upload_elements_num);
+                        cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
+
+                        compute_command_lists[submit_count]->CopyBufferRegion(
+                            constant_buffer[dispatch_count_in_submit].Get(), 0,
+                            cbv_upload_buffer[dispatch_count_in_submit].Get(), 0,
+                            constant_buffer_size);
+                        copy_dest_to_constant_barrier.Transition.pResource =
+                            constant_buffer[dispatch_count_in_submit].Get();
+                        compute_command_lists[submit_count]->ResourceBarrier(
+                            1, &copy_dest_to_constant_barrier);
+
+                        compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
+                            0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
+                    }
+
+                    if (upload_mode == use_dbo) {
+                        D3D12_GPU_VIRTUAL_ADDRESS buffer_location =
+                            constant_buffer[0]->GetGPUVirtualAddress() +
+                            dispatch_count * constant_buffer_size;
+                        compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
+                            0, buffer_location);
+                    }
+
+                    compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
+                        1, srv_uav_heap->GetGPUDescriptorHandleForHeapStart());
+                    compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
+                        2, CD3DX12_GPU_DESCRIPTOR_HANDLE(
+                               srv_uav_heap->GetGPUDescriptorHandleForHeapStart(),
+                               dispatch_count + 1, srv_uav_descriptor_size));
+
+                    compute_command_lists[submit_count]->Dispatch(dispatch_block_num, 1, 1);
+                }
+
+                ThrowIfFailed(compute_command_lists[submit_count]->Close());
+
+                ID3D12CommandList* submit_command_lists[] = {
+                    compute_command_lists[submit_count].Get()};
+                command_queue->ExecuteCommandLists(1, submit_command_lists);
+
+                ThrowIfFailed(command_queue->Signal(fence.Get(), signal_fence_value));
+            }
+
+            if (fence->GetCompletedValue() < signal_fence_value) {
+                ThrowIfFailed(fence->SetEventOnCompletion(signal_fence_value, fence_event));
+                WaitForSingleObject(fence_event, INFINITE);
+            }
+            end = std::chrono::high_resolution_clock::now();
+            elapsed_nanoseconds[frame_count] = end - start;
         }
-        end = std::chrono::high_resolution_clock::now();
-        elapsed_nanoseconds[frame_count] = end - start;
     }
 
     if (debug_mode) {
@@ -1023,6 +1181,44 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     std::cout << "Average frame time (ns) of " << std::to_string(frame_num)
               << " frames : " << total_time_nanoseconds / frame_num << " ns; " << std::endl;
     std::cout << std::endl;
+
+    if (use_timestamp_query) {
+        UINT64 total_time = 0;
+        UINT64* timing_data;
+        CD3DX12_RANGE read_range(0, dispatch_num_per_submit * 2 * sizeof(UINT64));
+        UINT64 gpu_freq;
+        ThrowIfFailed(command_queue->GetTimestampFrequency(&gpu_freq));
+
+        for (uint32_t i = 0; i < frame_num; ++i) {
+            UINT64 frame_time = 0;
+
+            ThrowIfFailed(query_read_back_buffers[i]->Map(0, &read_range,
+                                                          reinterpret_cast<void**>(&timing_data)));
+            for (uint32_t dispatch_count = 0; dispatch_count < dispatch_num_per_submit * submit_num;
+                 ++dispatch_count) {
+                frame_time += timing_data[dispatch_count * 2 + 1] - timing_data[dispatch_count * 2];
+            }
+            query_read_back_buffers[i]->Unmap(0, nullptr);
+
+            double frame_time_ns = frame_time * 1000000000 / double(gpu_freq);
+            std::cout << "Frame " << std::to_string(i)
+                      << " timestamp query time (ns) : " << frame_time_ns << " ns;" << std::endl;
+            std::cout << "Frame " << std::to_string(i) << " timestamp query time per dispatch (ns) "
+                      << frame_time_ns / (dispatch_num_per_submit * submit_num) << " ns;"
+                      << std::endl;
+
+            total_time += frame_time;
+        }
+        std::cout << std::endl;
+
+        double total_time_ns = total_time * 1000000000 / double(gpu_freq);
+        std::cout << "Average frame time (ns) of " << std::to_string(frame_num)
+                  << " frames : " << total_time_ns << " ns; " << std::endl;
+        std::cout << "Average dispatch time (ns) of " << std::to_string(frame_num) << " frames : "
+                  << total_time_ns / (dispatch_num_per_submit * submit_num * frame_num) << " ns; "
+                  << std::endl;
+        std::cout << std::endl;
+    }
 
     if (debug_mode) {
         uint32_t download_uav_buffer_index = 0;
