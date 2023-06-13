@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -166,7 +167,7 @@ int main(int argc, char* argv[]) {
     bool use_timestamp_query = false;
     uint32_t dispatch_block_num = 512;
     uint32_t dispatch_times_per_frame = 512;
-    uint32_t warm_run_num = 20;
+    uint32_t warm_run_num = 100;
     uint32_t frame_num = 10;
     uint32_t thread_block_size = 512;
 
@@ -178,6 +179,8 @@ int main(int argc, char* argv[]) {
     const size_t element_per_thread = 4;
     const size_t buffer_alignment_bytes = 256;
     const uint32_t dispatch_thread_num = thread_block_size * dispatch_block_num;
+    uint32_t discard_max_running_time_num = 1;
+    uint32_t discard_min_running_time_num = 1;
 
     for (int i = 0; i < argc; ++i) {
         if (std::string(argv[i]) == "-h" || std::string(argv[i]) == "--help") {
@@ -215,7 +218,7 @@ int main(int argc, char* argv[]) {
                          "default value is 10."
                       << std::endl;
             std::cout << "--warm_run_num NUM:                      setting warm run frame numbers, "
-                         "default value is 20."
+                         "default value is 100."
                       << std::endl;
             std::cout << "--constant_upload_bytes NUM:             setting upload constant bytes, "
                          "default value is 64, min: 16, max: 512, must divide by 16."
@@ -339,6 +342,9 @@ int main(int argc, char* argv[]) {
 
     const uint32_t constant_upload_elements_num =
         static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
+
+    frame_num += discard_max_running_time_num;
+    frame_num += discard_min_running_time_num;
 
     if (debug_mode) {
         Microsoft::WRL::ComPtr<ID3D12Debug> debug_controller;
@@ -1171,15 +1177,33 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     }
 
     double total_time_nanoseconds = 0.0;
+    double max_time = 0.0;
+    double min_time = DBL_MAX;
+    uint32_t max_frame_index = 0;
+    uint32_t min_frame_index = 0;
 
     for (uint32_t i = 0; i < frame_num; ++i) {
+        double frame_time = elapsed_nanoseconds[i].count();
         std::cout << "Frame " << std::to_string(i)
                   << " time (ns) : " << elapsed_nanoseconds[i].count() << " ns;" << std::endl;
+        if (frame_time > max_time) {
+            max_time = frame_time;
+            max_frame_index = i;
+        }
+        if (frame_time < min_time) {
+            min_time = frame_time;
+            min_frame_index = i;
+        }
         total_time_nanoseconds += elapsed_nanoseconds[i].count();
     }
 
-    std::cout << "Average frame time (ns) of " << std::to_string(frame_num)
-              << " frames : " << total_time_nanoseconds / frame_num << " ns; " << std::endl;
+    uint32_t useful_frame_num =
+        frame_num - discard_max_running_time_num - discard_min_running_time_num;
+    total_time_nanoseconds = total_time_nanoseconds - max_time - min_time;
+    std::cout << "Average frame time (ns) of " << std::to_string(useful_frame_num)
+              << " frames : " << total_time_nanoseconds / useful_frame_num << " ns; " << std::endl;
+    std::cout << "Discard the most slow frame " << max_frame_index << " and the most fast frame "
+              << min_frame_index << std::endl;
     std::cout << std::endl;
 
     if (use_timestamp_query) {
@@ -1188,6 +1212,10 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
         CD3DX12_RANGE read_range(0, dispatch_num_per_submit * 2 * sizeof(UINT64));
         UINT64 gpu_freq;
         ThrowIfFailed(command_queue->GetTimestampFrequency(&gpu_freq));
+        UINT64 max_time = 0;
+        UINT64 min_time = LLONG_MAX;
+        max_frame_index = 0;
+        min_frame_index = 0;
 
         for (uint32_t i = 0; i < frame_num; ++i) {
             UINT64 frame_time = 0;
@@ -1207,16 +1235,33 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                       << frame_time_ns / (dispatch_num_per_submit * submit_num) << " ns;"
                       << std::endl;
 
+            if (frame_time > max_time) {
+                max_time = frame_time;
+                max_frame_index = i;
+            }
+
+            if (frame_time < min_time) {
+                min_time = frame_time;
+                min_frame_index = i;
+            }
+
             total_time += frame_time;
         }
         std::cout << std::endl;
+        uint32_t useful_frame_num =
+            frame_num - discard_max_running_time_num - discard_min_running_time_num;
+        total_time = total_time - max_time - min_time;
 
         double total_time_ns = total_time * 1000000000 / double(gpu_freq);
-        std::cout << "Average frame time (ns) of " << std::to_string(frame_num)
-                  << " frames : " << total_time_ns << " ns; " << std::endl;
-        std::cout << "Average dispatch time (ns) of " << std::to_string(frame_num) << " frames : "
-                  << total_time_ns / (dispatch_num_per_submit * submit_num * frame_num) << " ns; "
-                  << std::endl;
+
+        std::cout << "Average frame time (ns) of " << std::to_string(useful_frame_num)
+                  << " frames : " << total_time_ns / useful_frame_num << " ns; " << std::endl;
+        std::cout << "Average dispatch time (ns) of " << std::to_string(useful_frame_num)
+                  << " frames : "
+                  << total_time_ns / (dispatch_num_per_submit * submit_num * useful_frame_num)
+                  << " ns; " << std::endl;
+        std::cout << "Discard the most slow frame " << max_frame_index
+                  << " and the most fast frame " << min_frame_index << std::endl;
         std::cout << std::endl;
     }
 
