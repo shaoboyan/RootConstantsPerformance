@@ -376,9 +376,13 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (device && desc.VendorId == 0x8086) {
+          continue;
+        }
+
         if (D3D12CreateDevice(hardware_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                              IID_PPV_ARGS(&device)) > 0) {
-            break;
+          IID_PPV_ARGS(&device)) > 0) {
+          break;
         }
 
         std::cout << "Query Adapters and creating device...." << std::endl;
@@ -699,6 +703,16 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
         device->CreateUnorderedAccessView(uav_buffer[i].Get(), nullptr, &uav_desc, uav_handle);
         uav_handle.Offset(1, srv_uav_descriptor_size);
+    }
+
+    std::vector<D3D12_RESOURCE_BARRIER> uav_barriers(uav_buffer_num);
+    for (uint32_t i = 0; i < uav_buffer_num; ++i) {
+      uav_barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      uav_barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      uav_barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      uav_barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+      uav_barriers[i].Transition.pResource = uav_buffer[i].Get();
+      uav_barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     }
 
     // Prepare uploading constants.
@@ -1044,6 +1058,8 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                                dispatch_count + 1, srv_uav_descriptor_size));
 
                     compute_command_lists[submit_count]->Dispatch(dispatch_block_num, 1, 1);
+                    compute_command_lists[submit_count]->ResourceBarrier(
+                      1, &uav_barriers[dispatch_count]);
 
                     compute_command_lists[submit_count]->EndQuery(
                         query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, dispatch_count * 2 + 1);
