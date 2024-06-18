@@ -165,6 +165,8 @@ int main(int argc, char* argv[]) {
     bool debug_mode = false;
     bool handle_oob_with_clamp = false;
     bool use_timestamp_query = false;
+    bool get_uploading_cpu_time = false;
+    bool get_map_cpu_time = false;
     uint32_t dispatch_block_num = 512;
     uint32_t dispatch_times_per_frame = 512;
     uint32_t warm_run_num = 100;
@@ -237,6 +239,13 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             std::cout << "--use_timestamp_query                    enable timestamp query."
                       << std::endl;
+            std::cout << "--get_uploading_cpu_time                 get uploading part cpu time "
+                         "including map-memcpy-unmap, and related command recording."
+                      << std::endl;
+            std::cout << "--get_map_cpu_time                       worked with use_uniform_buffer, "
+                         " get map-memcpy-unmap cpu time."
+                      << std::endl;
+
             return 1;
         }
 
@@ -320,6 +329,17 @@ int main(int argc, char* argv[]) {
             use_timestamp_query = true;
             continue;
         }
+
+        if (std::string(argv[i]) == "--get_uploading_cpu_time") {
+          get_uploading_cpu_time = true;
+          continue;
+        }
+
+        if (std::string(argv[i]) == "--get_map_cpu_time" &&
+            upload_mode == use_uniform_buffer) {
+          get_map_cpu_time = true;
+          continue;
+        }
     }
 
     std::cout << "Start running .... " << std::endl;
@@ -339,6 +359,8 @@ int main(int argc, char* argv[]) {
     std::cout << "cbuffer_use_array: " << (cbuffer_content_type == array) << std::endl;
     std::cout << "handle_oob_with_clamp: " << handle_oob_with_clamp << std::endl;
     std::cout << "use_timestamp_query: " << use_timestamp_query << std::endl;
+    std::cout << "get_uploading_cpu_time: " << get_uploading_cpu_time << std::endl;
+    std::cout << "get_map_cpu_time: " << get_map_cpu_time << std::endl;
 
     const uint32_t constant_upload_elements_num =
         static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
@@ -974,13 +996,25 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     }
 
     // Real run rounds, recording start time
-    std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
-    std::vector<std::chrono::duration<double, std::nano>> elapsed_nanoseconds;
+    std::chrono::time_point<std::chrono::high_resolution_clock> frame_start, frame_end;
+    std::vector<std::chrono::duration<double, std::nano>> frame_elapsed_nanoseconds;
+    frame_elapsed_nanoseconds.resize(frame_num);
+    
+    std::chrono::time_point<std::chrono::high_resolution_clock> cpu_uploading_start, cpu_uploading_end;
+    std::vector<std::chrono::duration<double, std::nano>> cpu_uploading_elapsed_nanoseconds;
+    if (get_uploading_cpu_time) {
+      cpu_uploading_elapsed_nanoseconds.resize(dispatch_times_per_frame);
+    }
+
+    std::chrono::time_point<std::chrono::high_resolution_clock> map_cpu_start, map_cpu_end;
+    std::vector<std::chrono::duration<double, std::nano>> map_cpu_elapsed_nanoseconds;
+    if (get_map_cpu_time) {
+      map_cpu_elapsed_nanoseconds.resize(dispatch_times_per_frame);
+    }
 
     if (use_timestamp_query) {
         for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
-            elapsed_nanoseconds.resize(frame_num);
-            start = std::chrono::high_resolution_clock::now();
+            frame_start = std::chrono::high_resolution_clock::now();
             uint32_t submit_dispatch_num = 0;
             for (uint32_t submit_count = 0; submit_count < submit_num;
                  ++submit_count, submit_dispatch_num += dispatch_num_per_submit) {
@@ -1014,20 +1048,45 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                         query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, dispatch_count * 2);
 
                     if (upload_mode == use_root_constants) {
+                        // Measure set root constants command cpu time
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
                             0, constant_upload_elements_num,
                             reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
+                        
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     if (upload_mode == use_uniform_buffer) {
+                        // Measure map-memcpy-unmap time for uniform buffer uploading
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        }
+
+                        // Measure map-memcpy-unmap time.
+                        if (get_map_cpu_time) {
+                          map_cpu_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         float* p_upload_data_begin;
                         CD3DX12_RANGE read_range(
-                            0, 0);  // We do not intend to read from this resource on the CPU.
+                          0, 0);  // We do not intend to read from this resource on the CPU.
                         ThrowIfFailed(cbv_upload_buffer[dispatch_count_in_submit]->Map(
-                            0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
+                          0, &read_range, reinterpret_cast<void**>(&p_upload_data_begin)));
                         memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
-                               sizeof(float) * constant_upload_elements_num);
+                          sizeof(float) * constant_upload_elements_num);
                         cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
+
+                        if (get_map_cpu_time) {
+                          map_cpu_end = std::chrono::high_resolution_clock::now();
+                          map_cpu_elapsed_nanoseconds[dispatch_count] = map_cpu_end - map_cpu_start;
+                        }
 
                         compute_command_lists[submit_count]->CopyBufferRegion(
                             constant_buffer[dispatch_count_in_submit].Get(), 0,
@@ -1040,14 +1099,29 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
+
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     if (upload_mode == use_dbo) {
+                        // Measure command recording time for us_dbo because all cpu data has been uploaded.
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         D3D12_GPU_VIRTUAL_ADDRESS buffer_location =
                             constant_buffer[0]->GetGPUVirtualAddress() +
                             dispatch_count * constant_buffer_size;
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, buffer_location);
+                        
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
@@ -1086,13 +1160,12 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                 ThrowIfFailed(fence->SetEventOnCompletion(signal_fence_value, fence_event));
                 WaitForSingleObject(fence_event, INFINITE);
             }
-            end = std::chrono::high_resolution_clock::now();
-            elapsed_nanoseconds[frame_count] = end - start;
+            frame_end = std::chrono::high_resolution_clock::now();
+            frame_elapsed_nanoseconds[frame_count] = frame_end - frame_start;
         }
     } else {
         for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
-            elapsed_nanoseconds.resize(frame_num);
-            start = std::chrono::high_resolution_clock::now();
+            frame_start = std::chrono::high_resolution_clock::now();
             uint32_t submit_dispatch_num = 0;
             for (uint32_t submit_count = 0; submit_count < submit_num;
                  ++submit_count, submit_dispatch_num += dispatch_num_per_submit) {
@@ -1123,12 +1196,32 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                         compute_state[dispatch_count_in_submit].Get());
 
                     if (upload_mode == use_root_constants) {
+                        // Measure set root constants command cpu time
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         compute_command_lists[submit_count]->SetComputeRoot32BitConstants(
                             0, constant_upload_elements_num,
                             reinterpret_cast<void*>(upload_constants[dispatch_count].data()), 0);
+
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     if (upload_mode == use_uniform_buffer) {
+                        // Measure map-memcpy-unmap time and command recording time for uniform buffer uploading
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        } 
+
+                        // Measure map-memcpy-unmap time.
+                        if (get_map_cpu_time) {
+                          map_cpu_start = std::chrono::high_resolution_clock::now();
+                        }
+                        
                         float* p_upload_data_begin;
                         CD3DX12_RANGE read_range(
                             0, 0);  // We do not intend to read from this resource on the CPU.
@@ -1137,6 +1230,11 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                         memcpy(p_upload_data_begin, upload_constants[dispatch_count].data(),
                                sizeof(float) * constant_upload_elements_num);
                         cbv_upload_buffer[dispatch_count_in_submit]->Unmap(0, nullptr);
+                        
+                        if (get_map_cpu_time) {
+                          map_cpu_end = std::chrono::high_resolution_clock::now();
+                          map_cpu_elapsed_nanoseconds[dispatch_count] = map_cpu_end - map_cpu_start;
+                        }
 
                         compute_command_lists[submit_count]->CopyBufferRegion(
                             constant_buffer[dispatch_count_in_submit].Get(), 0,
@@ -1149,14 +1247,30 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
+
+
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     if (upload_mode == use_dbo) {
+                        // Measure command recording time for us_dbo because all cpu data has been uploaded.
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         D3D12_GPU_VIRTUAL_ADDRESS buffer_location =
                             constant_buffer[0]->GetGPUVirtualAddress() +
                             dispatch_count * constant_buffer_size;
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, buffer_location);
+
+                        if (get_uploading_cpu_time) {
+                          cpu_uploading_end = std::chrono::high_resolution_clock::now();
+                          cpu_uploading_elapsed_nanoseconds[dispatch_count] = cpu_uploading_end - cpu_uploading_start;
+                        }
                     }
 
                     compute_command_lists[submit_count]->SetComputeRootDescriptorTable(
@@ -1182,8 +1296,8 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                 ThrowIfFailed(fence->SetEventOnCompletion(signal_fence_value, fence_event));
                 WaitForSingleObject(fence_event, INFINITE);
             }
-            end = std::chrono::high_resolution_clock::now();
-            elapsed_nanoseconds[frame_count] = end - start;
+            frame_end = std::chrono::high_resolution_clock::now();
+            frame_elapsed_nanoseconds[frame_count] = frame_end - frame_start;
         }
     }
 
@@ -1199,9 +1313,9 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
     uint32_t min_frame_index = 0;
 
     for (uint32_t i = 0; i < frame_num; ++i) {
-        double frame_time = elapsed_nanoseconds[i].count();
+        double frame_time = frame_elapsed_nanoseconds[i].count();
         std::cout << "Frame " << std::to_string(i)
-                  << " time (ns) : " << elapsed_nanoseconds[i].count() << " ns;" << std::endl;
+                  << " time (ns) : " << frame_elapsed_nanoseconds[i].count() << " ns;" << std::endl;
         if (frame_time > max_time) {
             max_time = frame_time;
             max_frame_index = i;
@@ -1210,16 +1324,65 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
             min_time = frame_time;
             min_frame_index = i;
         }
-        total_time_nanoseconds += elapsed_nanoseconds[i].count();
+        total_time_nanoseconds += frame_elapsed_nanoseconds[i].count();
     }
+
+    std::string uploading_mode = "use_uniform_buffer";
+
+    if (upload_mode == use_dbo) {
+      uploading_mode = "use_dbo";
+    }
+
+    if (upload_mode == use_root_constants) {
+      uploading_mode = "use_root_constants";
+    }
+
+    std::cout << "Uploading Mode: " << uploading_mode << std::endl;
 
     uint32_t useful_frame_num =
         frame_num - discard_max_running_time_num - discard_min_running_time_num;
     total_time_nanoseconds = total_time_nanoseconds - max_time - min_time;
     std::cout << "Average frame time (ns) of " << std::to_string(useful_frame_num)
               << " frames : " << total_time_nanoseconds / useful_frame_num << " ns; " << std::endl;
+
+
+    if (get_uploading_cpu_time) {
+      double total_cpu_uploading_time_nanoseconds = 0;
+      for (uint32_t i = 0; i < frame_num; ++i) {
+        if (i == min_frame_index || i == max_frame_index) {
+          continue;
+        }
+        for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+          ++dispatch_count) {
+          total_cpu_uploading_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+        }
+      }
+
+      std::cout << "Average cpu uploading time(ns) per dispatch of " << std::to_string(useful_frame_num)
+        << " frames: " << total_cpu_uploading_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+        << std::endl;
+    }
+
+    if (get_map_cpu_time) {
+      double total_map_cpu_time_nanoseconds = 0;
+      for (uint32_t i = 0; i < frame_num; ++i) {
+        if (i == min_frame_index || i == max_frame_index) {
+          continue;
+        }
+        for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+          ++dispatch_count) {
+          total_map_cpu_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+        }
+      }
+
+      std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
+      std::cout << "Average map cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
+        << " frames: " << total_map_cpu_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+        << std::endl;
+    }
+
     std::cout << "Discard the most slow frame " << max_frame_index << " and the most fast frame "
-              << min_frame_index << std::endl;
+      << min_frame_index << std::endl;
     std::cout << std::endl;
 
     if (use_timestamp_query) {
@@ -1270,12 +1433,49 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
         double total_time_ns = total_time * 1000000000 / double(gpu_freq);
 
+        std::cout << "Timestamp Query Enabled. Uploading Mode: " << uploading_mode << std::endl;
         std::cout << "Average frame time (ns) of " << std::to_string(useful_frame_num)
                   << " frames : " << total_time_ns / useful_frame_num << " ns; " << std::endl;
         std::cout << "Average dispatch time (ns) of " << std::to_string(useful_frame_num)
                   << " frames : "
                   << total_time_ns / (dispatch_num_per_submit * submit_num * useful_frame_num)
                   << " ns; " << std::endl;
+
+        if (get_uploading_cpu_time) {
+          double total_cpu_uploading_time_nanoseconds = 0;
+          for (uint32_t i = 0; i < frame_num; ++i) {
+            if (i == min_frame_index || i == max_frame_index) {
+              continue;
+            }
+            for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+              ++dispatch_count) {
+              total_cpu_uploading_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+            }
+          }
+
+          std::cout << "Timestamp Query Enabled. Average cpu uploading time(ns) per dispatch of " << std::to_string(useful_frame_num)
+            << " frames: " << total_cpu_uploading_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+            << std::endl;
+        }
+
+        if (get_map_cpu_time) {
+          double total_map_cpu_time_nanoseconds = 0;
+          for (uint32_t i = 0; i < frame_num; ++i) {
+            if (i == min_frame_index || i == max_frame_index) {
+              continue;
+            }
+            for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+              ++dispatch_count) {
+              total_map_cpu_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+            }
+          }
+
+          std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
+          std::cout << "Timestamp Query Enabled. Average map cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
+            << " frames: " << total_map_cpu_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+            << std::endl;
+        }
+
         std::cout << "Discard the most slow frame " << max_frame_index
                   << " and the most fast frame " << min_frame_index << std::endl;
         std::cout << std::endl;
