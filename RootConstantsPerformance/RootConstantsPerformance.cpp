@@ -167,6 +167,7 @@ int main(int argc, char* argv[]) {
     bool use_timestamp_query = false;
     bool get_uploading_cpu_time = false;
     bool get_map_cpu_time = false;
+    bool get_resource_barrier_cpu_time = false;
     uint32_t dispatch_block_num = 512;
     uint32_t dispatch_times_per_frame = 512;
     uint32_t warm_run_num = 100;
@@ -245,6 +246,9 @@ int main(int argc, char* argv[]) {
             std::cout << "--get_map_cpu_time                       worked with use_uniform_buffer, "
                          " get map-memcpy-unmap cpu time."
                       << std::endl;
+            std::cout << "--get_resource_barrier_cpu_time          worked with use_uniform_buffer, "
+              " get recording extra resource barrier command cpu time."
+              << std::endl;
 
             return 1;
         }
@@ -335,11 +339,20 @@ int main(int argc, char* argv[]) {
           continue;
         }
 
-        if (std::string(argv[i]) == "--get_map_cpu_time" &&
-            upload_mode == use_uniform_buffer) {
+        if (std::string(argv[i]) == "--get_map_cpu_time") {
           get_map_cpu_time = true;
           continue;
         }
+
+        if (std::string(argv[i]) == "--get_resource_barrier_cpu_time") {
+          get_resource_barrier_cpu_time = true;
+          continue;
+        }
+    }
+
+    if (upload_mode != use_uniform_buffer) {
+      get_map_cpu_time = false;
+      get_resource_barrier_cpu_time = false;
     }
 
     std::cout << "Start running .... " << std::endl;
@@ -361,6 +374,7 @@ int main(int argc, char* argv[]) {
     std::cout << "use_timestamp_query: " << use_timestamp_query << std::endl;
     std::cout << "get_uploading_cpu_time: " << get_uploading_cpu_time << std::endl;
     std::cout << "get_map_cpu_time: " << get_map_cpu_time << std::endl;
+    std::cout << "get_resource_barrier_cpu_time: " << get_resource_barrier_cpu_time << std::endl;
 
     const uint32_t constant_upload_elements_num =
         static_cast<uint32_t>(constant_upload_bytes / bytes_per_element);
@@ -1012,6 +1026,12 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       map_cpu_elapsed_nanoseconds.resize(dispatch_times_per_frame);
     }
 
+    std::chrono::time_point<std::chrono::high_resolution_clock> resource_barrier_cpu_start, resource_barrier_cpu_end;
+    std::vector<std::chrono::duration<double, std::nano>> resource_barrier_cpu_elapsed_nanoseconds;
+    if (get_resource_barrier_cpu_time) {
+      resource_barrier_cpu_elapsed_nanoseconds.resize(dispatch_times_per_frame);
+    }
+
     if (use_timestamp_query) {
         for (uint32_t frame_count = 0; frame_count < frame_num; ++frame_count) {
             frame_start = std::chrono::high_resolution_clock::now();
@@ -1071,7 +1091,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
                         // Measure map-memcpy-unmap time.
                         if (get_map_cpu_time) {
-                          map_cpu_start = std::chrono::high_resolution_clock::now();
+                          map_cpu_start = cpu_uploading_start;
                         }
 
                         float* p_upload_data_begin;
@@ -1088,17 +1108,30 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                           map_cpu_elapsed_nanoseconds[dispatch_count] = map_cpu_end - map_cpu_start;
                         }
 
+
                         compute_command_lists[submit_count]->CopyBufferRegion(
                             constant_buffer[dispatch_count_in_submit].Get(), 0,
                             cbv_upload_buffer[dispatch_count_in_submit].Get(), 0,
                             constant_buffer_size);
+                        
+                        if (get_resource_barrier_cpu_time) {
+                          resource_barrier_cpu_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         copy_dest_to_constant_barrier.Transition.pResource =
                             constant_buffer[dispatch_count_in_submit].Get();
+
                         compute_command_lists[submit_count]->ResourceBarrier(
                             1, &copy_dest_to_constant_barrier);
 
+                        if (get_resource_barrier_cpu_time) {
+                          resource_barrier_cpu_end = std::chrono::high_resolution_clock::now();
+                          resource_barrier_cpu_elapsed_nanoseconds[dispatch_count] = resource_barrier_cpu_end - resource_barrier_cpu_start;
+                        }
+
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
+
 
                         if (get_uploading_cpu_time) {
                           cpu_uploading_end = std::chrono::high_resolution_clock::now();
@@ -1219,7 +1252,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
                         // Measure map-memcpy-unmap time.
                         if (get_map_cpu_time) {
-                          map_cpu_start = std::chrono::high_resolution_clock::now();
+                          map_cpu_start = cpu_uploading_start;
                         }
                         
                         float* p_upload_data_begin;
@@ -1240,14 +1273,25 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
                             constant_buffer[dispatch_count_in_submit].Get(), 0,
                             cbv_upload_buffer[dispatch_count_in_submit].Get(), 0,
                             constant_buffer_size);
+
+
+                        if (get_resource_barrier_cpu_time) {
+                          resource_barrier_cpu_start = std::chrono::high_resolution_clock::now();
+                        }
+
                         copy_dest_to_constant_barrier.Transition.pResource =
                             constant_buffer[dispatch_count_in_submit].Get();
+
                         compute_command_lists[submit_count]->ResourceBarrier(
                             1, &copy_dest_to_constant_barrier);
+                        if (get_resource_barrier_cpu_time) {
+                          resource_barrier_cpu_end = std::chrono::high_resolution_clock::now();
+                          resource_barrier_cpu_elapsed_nanoseconds[dispatch_count] = resource_barrier_cpu_end - resource_barrier_cpu_start;
+                        }
+
 
                         compute_command_lists[submit_count]->SetComputeRootConstantBufferView(
                             0, constant_buffer[dispatch_count_in_submit]->GetGPUVirtualAddress());
-
 
                         if (get_uploading_cpu_time) {
                           cpu_uploading_end = std::chrono::high_resolution_clock::now();
@@ -1359,7 +1403,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
       }
 
       std::cout << "Average cpu uploading time(ns) per dispatch of " << std::to_string(useful_frame_num)
-        << " frames: " << total_cpu_uploading_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+        << " frames: " << total_cpu_uploading_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
         << std::endl;
     }
 
@@ -1371,13 +1415,31 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
         }
         for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
           ++dispatch_count) {
-          total_map_cpu_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+          total_map_cpu_time_nanoseconds += map_cpu_elapsed_nanoseconds[dispatch_count].count();
         }
       }
 
       std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
       std::cout << "Average map cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
-        << " frames: " << total_map_cpu_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+        << " frames: " << total_map_cpu_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
+        << std::endl;
+    }
+
+    if (get_resource_barrier_cpu_time) {
+      double total_resource_barrier_cpu_time_nanoseconds = 0;
+      for (uint32_t i = 0; i < frame_num; ++i) {
+        if (i == min_frame_index || i == max_frame_index) {
+          continue;
+        }
+        for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+          ++dispatch_count) {
+          total_resource_barrier_cpu_time_nanoseconds += resource_barrier_cpu_elapsed_nanoseconds[dispatch_count].count();
+        }
+      }
+
+      std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
+      std::cout << "Average resource barrier command cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
+        << " frames: " << total_resource_barrier_cpu_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
         << std::endl;
     }
 
@@ -1454,7 +1516,7 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
           }
 
           std::cout << "Timestamp Query Enabled. Average cpu uploading time(ns) per dispatch of " << std::to_string(useful_frame_num)
-            << " frames: " << total_cpu_uploading_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+            << " frames: " << total_cpu_uploading_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
             << std::endl;
         }
 
@@ -1466,13 +1528,31 @@ void CSMain(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
             }
             for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
               ++dispatch_count) {
-              total_map_cpu_time_nanoseconds += cpu_uploading_elapsed_nanoseconds[dispatch_count].count();
+              total_map_cpu_time_nanoseconds += map_cpu_elapsed_nanoseconds[dispatch_count].count();
             }
           }
 
           std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
           std::cout << "Timestamp Query Enabled. Average map cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
-            << " frames: " << total_map_cpu_time_nanoseconds / useful_frame_num * dispatch_times_per_frame << " ns; "
+            << " frames: " << total_map_cpu_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
+            << std::endl;
+        }
+
+        if (get_resource_barrier_cpu_time) {
+          double total_resource_barrier_cpu_time_nanoseconds = 0;
+          for (uint32_t i = 0; i < frame_num; ++i) {
+            if (i == min_frame_index || i == max_frame_index) {
+              continue;
+            }
+            for (uint32_t dispatch_count = 0; dispatch_count < dispatch_times_per_frame;
+              ++dispatch_count) {
+              total_resource_barrier_cpu_time_nanoseconds += resource_barrier_cpu_elapsed_nanoseconds[dispatch_count].count();
+            }
+          }
+
+          std::cout << "(Uploading Mode == use_uniform_buffer)" << std::endl;
+          std::cout << "Average resource barrier command cpu time(ns) per dispatch of " << std::to_string(useful_frame_num)
+            << " frames: " << total_resource_barrier_cpu_time_nanoseconds / (useful_frame_num * dispatch_times_per_frame) << " ns; "
             << std::endl;
         }
 
